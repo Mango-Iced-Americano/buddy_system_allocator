@@ -24,12 +24,16 @@ use spin::Mutex;
 
 #[cfg(feature = "alloc")]
 mod frame;
+#[cfg(feature = "metadata_heap")]
+mod metadata_heap;
 pub mod linked_list;
 #[cfg(test)]
 mod test;
 
 #[cfg(feature = "alloc")]
 pub use frame::*;
+#[cfg(feature = "metadata_heap")]
+pub use metadata_heap::*;
 
 /// A heap that uses buddy system with configurable order.
 ///

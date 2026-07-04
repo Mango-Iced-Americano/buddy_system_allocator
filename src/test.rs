@@ -5,6 +5,9 @@ use crate::linked_list;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 use core::mem::size_of;
+use core::ptr::NonNull;
+#[cfg(feature = "metadata_heap")]
+use crate::MetadataHeap;
 
 #[test]
 fn test_linked_list() {
@@ -336,4 +339,489 @@ fn test_frame_allocator_alloc_at_multiple() {
     assert_eq!(frame.alloc_at(8, 4), Some(8));
     assert_eq!(frame.alloc_at(12, 4), Some(12));
     assert!(frame.alloc(1).is_none());
+}
+
+// ============================================================================
+// HeapLike trait — shared conformance test infrastructure
+// ============================================================================
+
+#[cfg(feature = "metadata_heap")]
+use crate::InitError;
+
+use core::cmp::min;
+
+/// A page-aligned backing array for heap tests.
+#[repr(align(4096))]
+struct PageAligned<const N: usize>([u8; N]);
+
+/// Trait abstracting the common API between [`Heap`] and [`MetadataHeap`]
+/// so that conformance tests can be written once and exercised against
+/// both implementations.
+trait HeapLike {
+    /// Initialise with `[start, start + size)`.
+    ///
+    /// # Safety
+    ///
+    /// Same preconditions as [`Heap::init`] / [`MetadataHeap::try_init`].
+    unsafe fn init_region(&mut self, start: usize, size: usize) -> Result<(), ()>;
+
+    /// Allocate a block satisfying `layout`.
+    fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, ()>;
+
+    /// Deallocate a block previously returned by [`alloc`](HeapLike::alloc).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` and `layout` must exactly match a previous successful allocation
+    /// from this heap instance, and not already have been deallocated.
+    unsafe fn dealloc_region(&mut self, ptr: NonNull<u8>, layout: Layout);
+
+    /// Total bytes requested by the user (sum of `layout.size()`).
+    fn stats_alloc_user(&self) -> usize;
+
+    /// Total bytes actually carved from the heap (power-of-two rounded).
+    fn stats_alloc_actual(&self) -> usize;
+
+    /// Total usable bytes in the data region.
+    fn stats_total_bytes(&self) -> usize;
+}
+
+impl HeapLike for Heap<32> {
+    unsafe fn init_region(&mut self, start: usize, size: usize) -> Result<(), ()> {
+        unsafe {
+            self.init(start, size);
+        }
+        Ok(())
+    }
+
+    fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, ()> {
+        self.alloc(layout)
+    }
+
+    unsafe fn dealloc_region(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe {
+            self.dealloc(ptr, layout);
+        }
+    }
+
+    fn stats_alloc_user(&self) -> usize {
+        self.stats_alloc_user()
+    }
+    fn stats_alloc_actual(&self) -> usize {
+        self.stats_alloc_actual()
+    }
+    fn stats_total_bytes(&self) -> usize {
+        self.stats_total_bytes()
+    }
+}
+
+#[cfg(feature = "metadata_heap")]
+impl HeapLike for MetadataHeap<32, 3> {
+    unsafe fn init_region(&mut self, start: usize, size: usize) -> Result<(), ()> {
+        unsafe { self.try_init(start, size).map_err(|_| ()) }
+    }
+
+    fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, ()> {
+        self.alloc(layout)
+    }
+
+    unsafe fn dealloc_region(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe {
+            self.dealloc(ptr, layout);
+        }
+    }
+
+    fn stats_alloc_user(&self) -> usize {
+        self.stats_alloc_user()
+    }
+    fn stats_alloc_actual(&self) -> usize {
+        self.stats_alloc_actual()
+    }
+    fn stats_total_bytes(&self) -> usize {
+        self.stats_total_bytes()
+    }
+}
+
+// ============================================================================
+// Shared conformance helpers
+// ============================================================================
+
+/// Alloc 64 bytes, dealloc, verify stats reset.
+fn conformance_alloc_dealloc_round_trip<T: HeapLike>(mut heap: T, start: usize, size: usize) {
+    unsafe {
+        heap.init_region(start, size).unwrap();
+    }
+    assert!(heap.stats_total_bytes() > 0);
+    let layout = Layout::from_size_align(64, 1).unwrap();
+    let ptr = heap.alloc(layout).unwrap();
+    assert!(heap.stats_alloc_user() > 0);
+    assert!(heap.stats_alloc_actual() > 0);
+    unsafe {
+        heap.dealloc_region(ptr, layout);
+    }
+    assert_eq!(heap.stats_alloc_user(), 0);
+    assert_eq!(heap.stats_alloc_actual(), 0);
+}
+
+/// Alloc 8, 64, 256, 1024 bytes, dealloc all, stats=0.
+fn conformance_alloc_multiple_sizes<T: HeapLike>(mut heap: T, start: usize, size: usize) {
+    unsafe {
+        heap.init_region(start, size).unwrap();
+    }
+
+    let sizes: [usize; 4] = [8, 64, 256, 1024];
+    let mut allocs: [Option<(NonNull<u8>, Layout)>; 4] =
+        [const { None }; 4];
+
+    let mut expected_user: usize = 0;
+    for (i, &sz) in sizes.iter().enumerate() {
+        let layout = Layout::from_size_align(sz, 1).unwrap();
+        let ptr = heap.alloc(layout).unwrap();
+        expected_user += sz;
+        assert_eq!(heap.stats_alloc_user(), expected_user);
+        allocs[i] = Some((ptr, layout));
+    }
+
+    for slot in &allocs {
+        let (ptr, layout) = slot.unwrap();
+        unsafe {
+            heap.dealloc_region(ptr, layout);
+        }
+    }
+
+    assert_eq!(heap.stats_alloc_user(), 0);
+    assert_eq!(heap.stats_alloc_actual(), 0);
+}
+
+/// Exhaust the heap, verify next alloc fails.
+fn conformance_oom<T: HeapLike>(mut heap: T, start: usize, size: usize) {
+    unsafe {
+        heap.init_region(start, size).unwrap();
+    }
+
+    let layout = Layout::from_size_align(1, 1).unwrap();
+    let mut count: usize = 0;
+    let mut allocs: std::vec::Vec<NonNull<u8>> = std::vec::Vec::new();
+
+    while let Ok(ptr) = heap.alloc(layout) {
+        count += 1;
+        allocs.push(ptr);
+    }
+
+    assert!(count > 0, "should have allocated at least one block");
+    assert!(heap.alloc(layout).is_err());
+
+    // Cleanup
+    for ptr in allocs {
+        unsafe {
+            heap.dealloc_region(ptr, layout);
+        }
+    }
+}
+
+/// Alloc two buddies, free both, verify they merge (next alloc of double size succeeds).
+fn conformance_merge_after_free<T: HeapLike>(mut heap: T, start: usize, size: usize) {
+    unsafe {
+        heap.init_region(start, size).unwrap();
+    }
+
+    let layout_64 = Layout::from_size_align(64, 1).unwrap();
+    let ptr1 = heap.alloc(layout_64).unwrap();
+    let ptr2 = heap.alloc(layout_64).unwrap();
+
+    let addr1 = ptr1.as_ptr() as usize;
+    let addr2 = ptr2.as_ptr() as usize;
+
+    // In a buddy system, two consecutive allocs of the same order
+    // from a fresh heap should be buddies.
+    assert_eq!(
+        addr1 ^ addr2,
+        64,
+        "expected buddy addresses differing by 64"
+    );
+
+    unsafe {
+        heap.dealloc_region(ptr1, layout_64);
+        heap.dealloc_region(ptr2, layout_64);
+    }
+
+    // Now a 128-byte alloc should succeed (the two buddies merged).
+    let layout_128 = Layout::from_size_align(128, 1).unwrap();
+    let ptr3 = heap.alloc(layout_128).unwrap();
+
+    // The returned pointer should be the lower buddy address.
+    assert_eq!(ptr3.as_ptr() as usize, min(addr1, addr2));
+
+    unsafe {
+        heap.dealloc_region(ptr3, layout_128);
+    }
+}
+
+// ============================================================================
+// Conformance tests — Heap<32>
+// ============================================================================
+
+#[test]
+fn test_conformance_alloc_dealloc_round_trip_heap() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    conformance_alloc_dealloc_round_trip(Heap::<32>::empty(), space.0.as_ptr() as usize, N);
+}
+
+#[test]
+fn test_conformance_alloc_multiple_sizes_heap() {
+    const N: usize = 32768;
+    let space = PageAligned::<N>([0; N]);
+    conformance_alloc_multiple_sizes(Heap::<32>::empty(), space.0.as_ptr() as usize, N);
+}
+
+#[test]
+fn test_conformance_oom_heap() {
+    const N: usize = 256;
+    let space = PageAligned::<N>([0; N]);
+    conformance_oom(Heap::<32>::empty(), space.0.as_ptr() as usize, N);
+}
+
+#[test]
+fn test_conformance_merge_after_free_heap() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    conformance_merge_after_free(Heap::<32>::empty(), space.0.as_ptr() as usize, N);
+}
+
+// ============================================================================
+// Conformance tests — MetadataHeap<32, 3>
+// ============================================================================
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_conformance_alloc_dealloc_round_trip_mh() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    conformance_alloc_dealloc_round_trip(
+        MetadataHeap::<32, 3>::empty(),
+        space.0.as_ptr() as usize,
+        N,
+    );
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_conformance_alloc_multiple_sizes_mh() {
+    const N: usize = 32768;
+    let space = PageAligned::<N>([0; N]);
+    conformance_alloc_multiple_sizes(
+        MetadataHeap::<32, 3>::empty(),
+        space.0.as_ptr() as usize,
+        N,
+    );
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_conformance_oom_mh() {
+    const N: usize = 256;
+    let space = PageAligned::<N>([0; N]);
+    conformance_oom(
+        MetadataHeap::<32, 3>::empty(),
+        space.0.as_ptr() as usize,
+        N,
+    );
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_conformance_merge_after_free_mh() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    conformance_merge_after_free(
+        MetadataHeap::<32, 3>::empty(),
+        space.0.as_ptr() as usize,
+        N,
+    );
+}
+
+// ============================================================================
+// MetadataHeap-specific tests
+// ============================================================================
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_metadata_heap_init_too_small() {
+    const N: usize = 7;
+    let space = PageAligned::<N>([0; N]);
+    let start = space.0.as_ptr() as usize;
+    let mut heap = MetadataHeap::<32, 3>::empty();
+    let result = unsafe { heap.try_init(start, N) };
+    match result {
+        Err(InitError::TooSmall) => {} // expected
+        other => panic!("expected Err(TooSmall), got {other:?}"),
+    }
+    // Stats must remain unchanged.
+    assert_eq!(heap.stats_alloc_user(), 0);
+    assert_eq!(heap.stats_alloc_actual(), 0);
+    assert_eq!(heap.stats_total_bytes(), 0);
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_metadata_heap_stats_use_original_order() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    let start = space.0.as_ptr() as usize;
+    let mut heap = MetadataHeap::<32, 3>::empty();
+    unsafe {
+        heap.try_init(start, N).unwrap();
+    }
+
+    // 24 bytes rounds up to 32 (order 5).
+    let layout = Layout::from_size_align(24, 1).unwrap();
+    let ptr = heap.alloc(layout).unwrap();
+
+    // stats_alloc_actual should be 32 (2^5), not 24.
+    assert_eq!(heap.stats_alloc_actual(), 32);
+    assert_eq!(heap.stats_alloc_user(), 24);
+
+    unsafe {
+        heap.dealloc(ptr, layout);
+    }
+    assert_eq!(heap.stats_alloc_actual(), 0);
+    assert_eq!(heap.stats_alloc_user(), 0);
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_metadata_heap_absolute_alignment() {
+    const N: usize = 32768;
+    let space = PageAligned::<N>([0; N]);
+    // Shift start by 1 to create an unaligned region origin.
+    let start = (space.0.as_ptr() as usize) + 1;
+    let size = N - 1;
+
+    let mut heap = MetadataHeap::<32, 3>::empty();
+    unsafe {
+        heap.try_init(start, size).unwrap();
+    }
+
+    let layout = Layout::from_size_align(1, 4096).unwrap();
+    let ptr = heap.alloc(layout).unwrap();
+    assert_eq!(
+        ptr.as_ptr() as usize & 4095,
+        0,
+        "returned pointer should be 4096-aligned"
+    );
+
+    unsafe {
+        heap.dealloc(ptr, layout);
+    }
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_metadata_heap_min_order_controls_min_block() {
+    // MIN_ORDER=3 → smallest block 8 bytes (order 3).
+    {
+        const N: usize = 4096;
+        let space = PageAligned::<N>([0; N]);
+        let start = space.0.as_ptr() as usize;
+        let mut heap = MetadataHeap::<16, 3>::empty();
+        unsafe {
+            heap.try_init(start, N).unwrap();
+        }
+
+        let layout = Layout::from_size_align(1, 1).unwrap();
+        let ptr = heap.alloc(layout).unwrap();
+        assert_eq!(heap.stats_alloc_actual(), 8); // 2^3
+        unsafe {
+            heap.dealloc(ptr, layout);
+        }
+    }
+
+    // MIN_ORDER=6 → smallest block 64 bytes (order 6).
+    {
+        const N: usize = 4096;
+        let space = PageAligned::<N>([0; N]);
+        let start = space.0.as_ptr() as usize;
+        let mut heap = MetadataHeap::<16, 6>::empty();
+        unsafe {
+            heap.try_init(start, N).unwrap();
+        }
+
+        let layout = Layout::from_size_align(1, 1).unwrap();
+        let ptr = heap.alloc(layout).unwrap();
+        assert_eq!(heap.stats_alloc_actual(), 64); // 2^6
+        unsafe {
+            heap.dealloc(ptr, layout);
+        }
+    }
+}
+
+#[cfg(all(feature = "metadata_heap", debug_assertions))]
+#[test]
+#[should_panic(expected = "dealloc on non-Used block head")]
+fn test_metadata_heap_debug_double_free_panics() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    let start = space.0.as_ptr() as usize;
+    let mut heap = MetadataHeap::<32, 3>::empty();
+    unsafe {
+        heap.try_init(start, N).unwrap();
+    }
+
+    let layout = Layout::from_size_align(16, 1).unwrap();
+    let ptr = heap.alloc(layout).unwrap();
+    unsafe {
+        heap.dealloc(ptr, layout);
+    }
+    // Double-free should panic in debug builds.
+    unsafe {
+        heap.dealloc(ptr, layout);
+    }
+}
+
+#[cfg(feature = "metadata_heap")]
+#[test]
+fn test_metadata_heap_both_buddies_merge() {
+    const N: usize = 4096;
+    let space = PageAligned::<N>([0; N]);
+    let start = space.0.as_ptr() as usize;
+    let mut heap = MetadataHeap::<32, 3>::empty();
+    unsafe {
+        heap.try_init(start, N).unwrap();
+    }
+
+    let layout_64 = Layout::from_size_align(64, 1).unwrap();
+    let ptr1 = heap.alloc(layout_64).unwrap();
+    let ptr2 = heap.alloc(layout_64).unwrap();
+
+    let addr1 = ptr1.as_ptr() as usize;
+    let addr2 = ptr2.as_ptr() as usize;
+
+    // Verify they are buddies (addresses differ by block size).
+    assert_eq!(
+        addr1 ^ addr2,
+        64,
+        "expected buddy addresses differing by 64"
+    );
+
+    unsafe {
+        heap.dealloc(ptr1, layout_64);
+        heap.dealloc(ptr2, layout_64);
+    }
+
+    // After merging, a 128-byte alloc should succeed.
+    let layout_128 = Layout::from_size_align(128, 1).unwrap();
+    let ptr3 = heap.alloc(layout_128).unwrap();
+
+    // The return value should be the lower buddy address, 128-aligned.
+    assert_eq!(ptr3.as_ptr() as usize, min(addr1, addr2));
+    assert_eq!(
+        ptr3.as_ptr() as usize & 127,
+        0,
+        "merged block should be 128-aligned"
+    );
+
+    unsafe {
+        heap.dealloc(ptr3, layout_128);
+    }
 }
