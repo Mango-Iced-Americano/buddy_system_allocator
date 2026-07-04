@@ -11,7 +11,7 @@ authors = [
   "Vinay Chandra Dommeti <github@vinay.vc>",
   "Andrew Walbran <qwandor@google.com>",
 ]
-edition = "2024"
+edition = "2021"
 license = "MIT"
 
 [features]
